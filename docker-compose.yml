@@ -1,24 +1,98 @@
-version: '3.8'
+# Full stack: MySQL + dashboard-user (8081) + dashboard-security (8080).
+#
+# Prerequisites (quickstart.sh does all of this):
+#   ./keygen.sh                                                   # JWT key pairs in ./jwt
+#   cp .env.example .env && edit                                  # passwords etc.
+#   ./mvnw -B clean package -DskipTests -Dquarkus.container-image.build=true
+#   docker compose up -d --wait
+
+name: dashboard
+
 services:
-  user-mangement:
-    container_name: user-management
-    image: dashboard/user-management:1.0-SNAPSHOT
+  mysql:
+    image: mysql:8.4
+    container_name: dashboard-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: user_management
+      MYSQL_USER: ${DB_USER:-dashboard}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+    # not published on the host to avoid clashing with a local MySQL used by `quarkus:dev`;
+    # uncomment to inspect the database: ports: ['127.0.0.1:3307:3306']
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      # TCP ping: only succeeds once the real server (not the init-time one) is listening
+      test: ['CMD-SHELL', 'mysqladmin ping -h 127.0.0.1 -u root -p"$$MYSQL_ROOT_PASSWORD" --silent']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  dashboard-user:
+    image: dashboard/dashboard-user:1.0-SNAPSHOT
+    container_name: dashboard-user
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
     ports:
       - '8081:8081'
     environment:
-      MP_JWT_VERIFY_PUBLICKEY_LOCATION: /jwt/publicKey.pem
+      DB_URL: jdbc:mysql://mysql:3306/user_management
+      DB_USER: ${DB_USER:-dashboard}
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      # dashboard-user owns the schema; switch to "validate" once a migration tool is in place
+      DB_SCHEMA_STRATEGY: update
+      JWT_KEY_DIR: /jwt
+      SYSTEM_FOLDER: /data/GroupProject
+      PYTHON_SERVICE_URL: ${PYTHON_SERVICE_URL:-http://host.docker.internal:5000}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
     volumes:
-      - type: bind
-        source: ./jwt
-        target: /jwt
-  authentication-jwt:
-    container_name: authentication-jwt
-    image: dashboard/jwt:1.0-SNAPSHOT
+      # verification (signing public) + decryption (encryption private) keys only
+      - ./jwt/sign-public.pem:/jwt/sign-public.pem:ro
+      - ./jwt/enc-private.pem:/jwt/enc-private.pem:ro
+      - user-data:/data
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://localhost:8081/q/health/ready']
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  dashboard-security:
+    image: dashboard/dashboard-security:1.0-SNAPSHOT
+    container_name: dashboard-security
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      # dashboard-user creates the users table that this service validates and reads
+      dashboard-user:
+        condition: service_healthy
     ports:
-      - '8082:8082'
+      - '8080:8080'
     environment:
-      SMALLRYE_JWT_SIGN_KEY_LOCATION: /jwt/privateKey.pem
+      DB_URL: jdbc:mysql://mysql:3306/user_management
+      DB_USER: ${DB_USER:-dashboard}
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      JWT_KEY_DIR: /jwt
+      JWT_LIFESPAN: ${JWT_LIFESPAN:-3600}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
     volumes:
-      - type: bind
-        source: ./jwt
-        target: /jwt
+      # signing (private) + encryption (public) keys only
+      - ./jwt/sign-private.pem:/jwt/sign-private.pem:ro
+      - ./jwt/enc-public.pem:/jwt/enc-public.pem:ro
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://localhost:8080/q/health/ready']
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+volumes:
+  mysql-data:
+  user-data:

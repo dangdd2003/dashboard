@@ -34,6 +34,7 @@ google-services.json
 
 target/
 jwt
+jwt/
 
 # Visual Studio Code
 .vscode
@@ -46,3 +47,6 @@ jwt
 
 # Other services
 GroupProject/
+
+# Local secrets / runtime data
+.env
