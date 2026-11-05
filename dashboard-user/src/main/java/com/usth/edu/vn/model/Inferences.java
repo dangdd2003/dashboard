@@ -1,7 +1,5 @@
 package com.usth.edu.vn.model;
 
-import static jakarta.persistence.TemporalType.TIMESTAMP;
-
 import java.util.Date;
 
 import com.fasterxml.jackson.annotation.JsonIdentityInfo;
@@ -28,7 +26,6 @@ public class Inferences {
   @GeneratedValue(strategy = GenerationType.IDENTITY)
   private long id;
 
-  @Temporal(TIMESTAMP)
   private Date createTime;
 
   private String result;

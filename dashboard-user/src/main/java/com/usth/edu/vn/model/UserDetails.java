@@ -14,8 +14,6 @@ import lombok.NoArgsConstructor;
 
 import java.util.Date;
 
-import static jakarta.persistence.TemporalType.TIMESTAMP;
-
 @Data
 @Builder
 @Entity
@@ -40,7 +38,6 @@ public class UserDetails {
     @ValidEmail
     private String email;
 
-    @Temporal(TIMESTAMP)
     private Date createTime;
 
     @OneToOne

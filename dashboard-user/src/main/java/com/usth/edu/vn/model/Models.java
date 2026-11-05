@@ -1,7 +1,5 @@
 package com.usth.edu.vn.model;
 
-import static jakarta.persistence.TemporalType.TIMESTAMP;
-
 import java.util.Date;
 import java.util.Set;
 
@@ -38,7 +36,6 @@ public class Models {
   @Column(columnDefinition = "TEXT")
   private String description;
 
-  @Temporal(TIMESTAMP)
   private Date createTime;
 
   @ManyToOne

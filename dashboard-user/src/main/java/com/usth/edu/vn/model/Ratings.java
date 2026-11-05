@@ -1,7 +1,5 @@
 package com.usth.edu.vn.model;
 
-import static jakarta.persistence.TemporalType.TIMESTAMP;
-
 import java.util.Date;
 
 import com.fasterxml.jackson.annotation.JsonIdentityInfo;
@@ -31,7 +29,6 @@ public class Ratings {
   @Column(columnDefinition = "TEXT")
   private String comment;
 
-  @Temporal(TIMESTAMP)
   private Date createTime;
 
   @ManyToOne

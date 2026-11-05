@@ -1,8 +1,8 @@
 package com.usth.edu.vn.repository;
 
-import com.speedment.jpastreamer.application.JPAStreamer;
 import com.usth.edu.vn.model.UserDetails;
 import io.quarkus.hibernate.orm.panache.PanacheRepository;
+import io.quarkus.panache.common.Page;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -13,16 +13,12 @@ import java.util.List;
 public class UserDetailsRepository implements PanacheRepository<UserDetails> {
 
     @Inject
-    JPAStreamer jpaStreamer;
-
-    @Inject
     UserRepository userRepository;
 
     private static final int PAGE_SIZE = 20;
 
     public List<UserDetails> findAllUsers() {
-        return jpaStreamer.stream(UserDetails.class)
-                .toList();
+        return listAll();
     }
 
     public UserDetails getUserDetail(long user_id) {
@@ -38,10 +34,9 @@ public class UserDetailsRepository implements PanacheRepository<UserDetails> {
     }
 
     public List<UserDetails> findPagingUsers(long pageNo) {
-        return jpaStreamer.stream(UserDetails.class)
-                .skip(pageNo * PAGE_SIZE)
-                .limit(PAGE_SIZE)
-                .toList();
+        return findAll()
+                .page(Page.of(Math.toIntExact(pageNo), PAGE_SIZE))
+                .list();
     }
 
     public List<UserDetails> searchUsers(String keyWord) {

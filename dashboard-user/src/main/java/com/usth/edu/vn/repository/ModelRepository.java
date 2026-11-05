@@ -5,6 +5,8 @@ import static com.usth.edu.vn.services.FileName.MODELS;
 
 import java.io.File;
 import java.io.IOException;
+import java.sql.Timestamp;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
@@ -230,7 +232,8 @@ public class ModelRepository implements PanacheRepository<Models> {
       modelDto.setUsername(o[8].toString());
       modelDto.setFirstname(o[9].toString());
       modelDto.setLastname(o[10].toString());
-      modelDto.setCreateTime((Date) o[11]);
+      // Hibernate ORM 7 returns java.time types for native query datetime columns
+      modelDto.setCreateTime(o[11] instanceof LocalDateTime createTime ? Timestamp.valueOf(createTime) : (Date) o[11]);
       allModels.add(modelDto);
     }
     return allModels;
