@@ -1,219 +1,214 @@
 package com.usth.edu.vn.services;
 
-import static com.usth.edu.vn.exception.ExceptionType.USER_NOT_FOUND;
+import java.util.List;
+import java.util.function.Supplier;
+import java.util.regex.Pattern;
 
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.io.OutputStreamWriter;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.Optional;
-import java.util.Scanner;
-
-import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.eclipse.microprofile.rest.client.inject.RestClient;
+import org.jboss.logging.Logger;
 import org.jboss.resteasy.reactive.multipart.FileUpload;
 
-import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.JsonMappingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.usth.edu.vn.exception.CustomException;
-import com.usth.edu.vn.model.Inferences;
 import com.usth.edu.vn.model.Models;
-import com.usth.edu.vn.model.Resources;
-import com.usth.edu.vn.model.Users;
 import com.usth.edu.vn.repository.InferenceRepository;
 import com.usth.edu.vn.repository.ModelRepository;
-import com.usth.edu.vn.repository.ResourceRepository;
-import com.usth.edu.vn.repository.UserRepository;
+import com.usth.edu.vn.services.ml.HttpErrors;
+import com.usth.edu.vn.services.ml.InferenceRequest;
+import com.usth.edu.vn.services.ml.PredictionResponse;
+import com.usth.edu.vn.services.ml.PythonModelClient;
+import com.usth.edu.vn.services.ml.TestSampleParser;
+import com.usth.edu.vn.services.ml.TrainingResponse;
 
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
-import lombok.Data;
+import jakarta.ws.rs.ProcessingException;
+import jakarta.ws.rs.WebApplicationException;
 
+/**
+ * Calls the Python ML service and records the outcome.
+ *
+ * Deliberately NOT transactional: the remote call runs without holding a DB
+ * connection/transaction, and the result is persisted afterwards in a short
+ * transaction ({@link InferenceRepository#recordInference},
+ * {@link InferenceRepository#recordTrainingResult}).
+ */
 @ApplicationScoped
 public class InferenceService {
 
-  @ConfigProperty(name = "python-service.protocol", defaultValue = "http")
-  String protocol;
+  private static final Logger LOG = Logger.getLogger(InferenceService.class);
 
-  @ConfigProperty(name = "python-service.host", defaultValue = "0.0.0.0")
-  String host;
+  static final Pattern MODEL_TYPE = Pattern.compile("[A-Za-z0-9_-]{1,64}");
+  static final Pattern MODEL_NAME = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]{0,127}");
+  static final int MAX_NDIM = 10_000;
+  /** Stays below MySQL TEXT (65,535 bytes) for ASCII JSON. */
+  static final int MAX_RESULT_CHARS = 60_000;
+  /** Length of the {@code resources.filepath} column. */
+  static final int MAX_FILEPATH_CHARS = 255;
 
-  @ConfigProperty(name = "python-service.port", defaultValue = "5000")
-  String port;
+  @Inject
+  @RestClient
+  PythonModelClient pythonClient;
 
   @Inject
   ModelRepository modelRepository;
 
   @Inject
-  ResourceRepository resourceRepository;
-
-  @Inject
-  UserRepository userRepository;
-
-  @Inject
   InferenceRepository inferenceRepository;
 
-  public Training trainEvalMPAP(long user_id, int pca_dim, long model_id)
-      throws IOException, CustomException {
+  @Inject
+  ObjectMapper objectMapper;
 
-    Optional<Users> existedUser = userRepository.findByIdOptional(user_id);
-    Optional<Models> existedModel = modelRepository.findByIdOptional(model_id);
+  /** Train + evaluate {@code modelId} for the caller; stores the produced params file as a resource. */
+  public TrainingResponse trainEvalMPAP(long callerId, long modelId, int pcaDim) {
+    validateNdim(pcaDim);
+    ModelTarget target = resolveModel(modelId);
 
-    if (existedUser.isEmpty()) {
-      throw new CustomException(USER_NOT_FOUND);
-    } else if (existedModel.isEmpty()) {
-      throw new CustomException("Model not found!");
+    TrainingResponse training = callUpstream("Training",
+        () -> pythonClient.run(target.owner(), target.type(), target.name(), pcaDim, callerId));
+
+    if (training == null || training.result() == null || training.result().isBlank()) {
+      throw HttpErrors.status(502, "ML service returned no training result");
     }
-
-    Models model = existedModel.get();
-    String modeltype = model.getType();
-    String modelname = new File(model.getFilepath()).getName().replaceFirst("[.][^.]+$", "");
-    String pathparams = "/model/" + model.getUser().getId() + "/" + modeltype + "/" + modelname + "/run";
-    String queryparams = "ndim=" + pca_dim + "&user=" + user_id;
-    URL url = new URL(protocol + "://" + host + ":" + port + pathparams + "?" + queryparams);
-    // URL url = new
-    // URL("http://localhost:5000/model/MPAP/Linear_Regression/v1/run?ndim=3&user=MPAP");
-
-    HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-    connection.setRequestMethod("GET");
-
-    int responseCode = connection.getResponseCode();
-    if (responseCode == HttpURLConnection.HTTP_OK) {
-
-      Training training = objectMapping(connection.getInputStream(), Training.class);
-
-      Resources resource = new Resources();
-      resource.setType("ParamsFiles");
-      resource.setFilepath(training.getResult());
-      resourceRepository.addResource(user_id, resource);
-
-      return training;
-
-    } else {
-      throw new CustomException("Training and evaluation seems not working at all!");
+    if (training.result().length() > MAX_FILEPATH_CHARS) {
+      throw HttpErrors.status(502, "ML service returned an invalid training result");
     }
+    inferenceRepository.recordTrainingResult(callerId, training.result());
+    return training;
   }
 
-  public Object inferenceMPAP(long user_id,
-      long model_id,
-      Integer pca_dim,
-      FileUpload input)
-      throws IOException, CustomException {
+  /** Run an inference of {@code modelId} on the uploaded test sample; stores the raw result. */
+  public PredictionResponse inferenceMPAP(long callerId, long modelId, Integer pcaDim, FileUpload sample) {
+    if (pcaDim != null) {
+      validateNdim(pcaDim);
+    }
+    List<Double> input = TestSampleParser.parse(sample);
+    ModelTarget target = resolveModel(modelId);
 
-    Optional<Users> existedUser = userRepository.findByIdOptional(user_id);
-    Optional<Models> existedModel = modelRepository.findByIdOptional(model_id);
+    JsonNode body = callUpstream("Inference",
+        () -> pythonClient.inference(target.owner(), target.type(), target.name(), pcaDim, callerId,
+            new InferenceRequest(input)));
 
-    if (existedUser.isEmpty()) {
-      throw new CustomException(USER_NOT_FOUND);
-    } else if (existedModel.isEmpty()) {
-      throw new CustomException("Model not found!");
+    if (body == null || !body.isObject()) {
+      throw HttpErrors.status(502, "ML service returned an invalid inference response");
+    }
+    PredictionResponse prediction;
+    try {
+      prediction = objectMapper.treeToValue(body, PredictionResponse.class);
+    } catch (JsonProcessingException | IllegalArgumentException e) {
+      LOG.warnf("Inference: could not map ML service response: %s", e.getMessage());
+      throw HttpErrors.status(502, "ML service returned an invalid inference response");
     }
 
-    Models model = existedModel.get();
-    String modeltype = model.getType();
-    String modelname = new File(model.getFilepath()).getName().replaceFirst("[.][^.]+$", "");
-    String pathparams = "/model/" + model.getUser().getId() + "/" + modeltype + "/" + modelname + "/inference";
-    String queryparams = null;
-    if (pca_dim == null) {
-      queryparams = "user=" + user_id;
-    } else {
-      queryparams = "ndim=" + pca_dim + "&user=" + user_id;
-    }
-    URL url = new URL(protocol + "://" + host + ":" + port + pathparams + "?" + queryparams);
-    // URL url = new
-    // URL("http://localhost:5000/model/MPAP/Linear_Regression/v1/inference?ndim=3&user=MPAP");
-
-    HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-    connection.setRequestMethod("POST");
-    connection.setRequestProperty("Content-Type", "application/json");
-    connection.setDoOutput(true);
-
-    Path file = input.uploadedFile();
-    String data = Files.readString(file);
-
-    // String requestBody =
-    // "{\"input\":[1.9599,1.9447,1.9289,1.9158,1.8998,1.8856,1.8781,1.8695,1.8605,1.8554,1.8477,1.837,1.8284,1.8221,1.8189,1.8153,1.8108,1.8039,1.7983,1.7927,1.7837,1.7758,1.7696,1.7639,1.7575,1.7514,1.7578,1.7681,1.7781,1.7930000000000001,1.8093,1.8233,1.827,1.8213,1.8093,1.7945,1.7795,1.7716,1.7718,1.7797,1.7902,1.8101,1.8411,1.8743,1.8996,1.9086,1.9067,1.8969999999999998,1.8841,1.87,1.8526,1.8237,1.82,1.8369,1.8564,1.8753,1.8922,1.9082,1.9217,1.9333,1.9477,1.9612,1.9728,1.9867,2.0031,2.0223,2.0454,2.0679,2.0862,2.1043,2.1197,2.1304,2.1395,2.1491,2.1617,2.1711,2.177,2.1794,2.1742,2.1654,2.1574,2.1591,2.1683,2.1821,2.2007,2.2230000000000003,2.2478,2.2641,2.272,2.2741,2.2774,2.2834,2.2934,2.3057,2.3185,2.3295,2.3322,2.3269,2.3138,2.3068,2.3071,2.3148,2.3185,2.3179,2.3194,2.33,2.3480000000000003,2.3583,2.3691,2.381,2.3934,2.4067,2.4202,2.4326,2.437,2.4375,2.4447,2.454,2.4675,2.4917,2.5192,2.5376,2.522,2.4729,2.4113,2.3824,2.3788,2.3912,2.3996,2.4083,2.4163,2.4216,2.4366,2.4551,2.4699,2.4731,2.4718,2.475,2.4884,2.5069,2.5267,2.5327,2.5356,2.5437,2.5586,2.5748,2.5891,2.6034,2.6174,2.6318,2.6519,2.6702,2.6861,2.7059,2.7328,2.7668,2.8042,2.8442,2.8861,2.9278,2.9797,3.0385,3.096,3.1636,3.239,3.3198,3.3914,3.4625,3.5422,3.6397,3.7395,3.8338,3.9335,4.045,4.1661,4.2623,4.3458,4.4247,4.5242,4.627,4.7295,4.8318,4.9229,5.01,5.1037,5.1571,5.1798,5.1781,5.1805,5.1856,5.1951,5.2234,5.2547,5.2869,5.3349,5.3791,5.4204,5.4685,5.5199,5.5774,5.6459,5.6939,5.7253,5.7418,5.7524,5.7699,5.7957,5.8,5.7945,5.7845,5.7772,5.7668,5.7519,5.7306,5.7013,5.6658,5.6268,5.5948,5.5551,5.5044,5.4455,5.3953,5.3543,5.3177,5.2829,5.2452,5.2009,5.1661,5.1276,5.0819,5.0429,5.0125,4.9898,4.9722,4.9572,4.9531,4.9649,4.9564,4.9326,4.9017,4.888999999999999,4.8925,4.9017,4.8996,4.9006,4.9016,4.9,4.8892,4.8777,4.8677,4.8567,4.8411,4.8284,4.8256,4.8197,4.8139,4.808,4.795,4.7826,4.7685,4.7461,4.73,4.7133,4.6924,4.6719,4.6448,4.6126,4.5797,4.5594,4.5454,4.5329,4.5184,4.5075,4.4988,4.4887,4.4830000000000005,4.4796,4.477,4.4731,4.4707,4.4677,4.4598,4.4519,4.4389,4.422,4.4202,4.4707,4.5607,4.6615,4.541,4.405,4.3435,4.3271,4.3177,4.3061,4.2866,4.2661,4.2395,4.2115,4.1956,4.1749,4.159,4.1533,4.1615,4.1432,4.1072,4.0678,4.0475,4.0347,4.0218,4.0004,3.9807,3.9661,3.9541,3.9265,3.9129,3.9019,3.8823,3.8765,3.8710000000000004,3.8646,3.859,3.8521,3.8522,3.8594,3.8667,3.8712,3.8841,3.9033,3.9086,3.9228,3.9428,3.9674,4.013999999999999,4.0575,4.1005,4.1476,4.1845,4.2453,4.3333,4.447,4.5635,4.696000000000001,4.8444,5.0061,5.2134,5.4477,5.6951,5.9465,6.2226,6.5203,6.8245,7.1223,7.4701,7.8297,8.1844,8.53,8.9103,9.3005,9.7032,10.1246,10.5145,10.9518,11.4588,12.0304,12.6066,13.1219,13.5319,13.8368,14.1088,14.5885,15.2006,15.8279,16.3617,16.8229,17.3233,17.887,18.4487,18.9847,19.4527,19.902,20.4151,21.0323,21.6824,22.3043,22.8655,23.3974,23.9033,24.3758,24.8137,25.2232,25.6309,26.0563,26.4921,26.9208,27.3399,27.7436,28.1325,28.4919,28.7877,29.0544,29.2965,29.5253,29.7553,29.9741,30.4156,31.4297,32.9036,34.2803,34.3567,33.3944,32.1537,31.2255,30.1271,29.3601,29.0827,29.2187,29.6154,30.095,30.4851,30.8416,31.1594,31.3837,31.5235,31.6258,31.6951,31.7436,31.7912,31.8101,31.8415,31.8819,31.9269,31.9807,32.0272,32.11,32.24,32.3514,32.3101,32.0851,31.908,31.8297,31.8214,31.8065,31.8091,31.8083,31.8109,31.8493,31.9298,31.987,32.0253,32.0067,31.971,31.9381,31.8739,31.8869,31.9771,32.0792,32.1951,32.3559,32.5383,32.7553,32.9778,33.1083,33.0355,32.7127,32.2924,31.7498,31.2857,31.1557,31.4236,31.7817,31.7076,31.3643,31.2312,31.4067,31.6868,31.8028,31.8223,31.7555,31.7022,31.6451,31.5597,31.4717,31.4535,31.4785,31.543000000000003,31.6403,31.7402,31.8174,31.8891,31.9595,32.0082,32.0475,32.0669,32.1007,32.2085,32.3458,32.4127,32.3574,32.2497,32.2653,32.3504,32.255,31.9511,31.6636,31.6088,31.7604,31.9229,32.0164,32.0762,32.0931,32.161,32.3388,32.4792,32.4116,32.1864,31.9472,31.8028,31.8759,32.0147,32.0915,32.1513,32.185,32.1652,32.1399,32.1522,32.1394,32.1897,32.1897,32.1715,32.0987,32.1017,32.1761,32.2271,32.2008,32.1052,32.0623,32.0127,32.0864,32.2864,32.4705,32.6368,32.7956,32.8771,32.8159,32.6258,32.3114,31.927,31.4905,30.936,30.5563,30.424,30.76,31.5306,32.346,32.6983,32.3918,31.7648,31.3461,31.1567,31.3313,31.6003,31.5069,31.1619,30.8689,30.6582,30.3529,30.274,30.5835,31.1124,31.6184,31.8014,31.6553,31.6491,31.6573,32.1921,33.1143,33.5133,33.4843,33.1562,32.7763,32.5438,29.7433,27.7461,26.2168,26.0422,25.9985,26.7688,27.9977,29.4659,30.0774,29.4883,29.1446,28.6407,28.1293,27.8172,27.5849,28.0905,28.1484,27.9527,28.197,28.0815,27.3842,27.1373,27.5469,27.4967,27.4813,27.5671,27.4132,26.968000000000004,27.0924,27.5573,28.0162,27.8718,27.5963,27.2227,27.3649,28.2387,28.816999999999997,28.9676,29.2924,28.9249,28.3206,28.1872,28.0785,27.4081,27.2949,27.1488,27.2267,27.0754,26.6033,26.3812,26.2183,26.0667,25.9293,25.8061,25.6972,25.6026,25.5222,25.456,25.4041,25.3665,25.3431,25.3339,25.3391,25.3583,25.3909,25.436999999999998,25.4975,25.573,25.6542,25.7017,25.754,25.8117,25.8719,25.9316,25.988000000000003,26.0381,26.0793,26.1126,26.1402,26.1641,26.1864,26.2091,26.2343,26.2594,26.2821,26.3044,26.3287,26.3571,26.3918,26.436,26.494,26.5607,26.6302,26.6963,26.7527,26.7935,26.8179,26.8304,26.8348,26.8344,26.8328,26.8337,26.8382,26.8401,26.8405,26.8416,26.8454,26.854,26.8697,26.8942,26.9255,26.9608,26.9972,27.0319,27.0619,27.0852,27.1033,27.1184,27.1324,27.1474,27.1653,27.188000000000002,27.2153,27.2458,27.2784,27.3122,27.3463,27.3797,27.4124,27.4459,27.4797,27.5135,27.5468,27.5791,27.6099,27.6376,27.663,27.6879,27.7143,27.7438,27.7782,27.8175,27.8596,27.9046,27.9529,28.0047,28.0602,28.1201,28.1875,28.2607,28.3367,28.4128,28.4861,28.5537,28.6163,28.6764,28.7342,28.7895,28.8426,28.8934,28.9426,28.9923,29.0411,29.0868,29.1272,29.1601,29.1835,29.2044,29.2245,29.2381,29.2396,29.2233,29.1836,29.1173,29.0309,28.925,28.7998,28.6552,28.4911,28.3075,28.1087,27.8939,27.6593,27.4014,27.1164,26.8007,26.4438,26.0386,25.6007,25.146,24.6907,24.2509,23.8398,23.4294,23.0169,22.6146,22.2343,21.8881,21.5879,21.3372,21.1258,20.9487,20.8013,20.6789,20.5768,20.4927,20.4419,20.4211,20.4211,20.4332,20.4483,20.4574,20.465,20.4799,20.4993,20.5206,20.5411,20.5581,20.5681,20.568,20.5631,20.5592,20.5623,20.5782,20.6128,20.6673,20.7372,20.8186,20.9078,21.0009,21.094,21.1875,21.2895,21.3966,21.5046,21.6092,21.7064,21.7924,21.8718,21.9463,22.0151,22.0774,22.1326,22.1799,22.2167,22.2411,22.256999999999998,22.2681,22.2784,22.2917,22.3117,22.3367,22.3642,22.3922,22.4185,22.441,22.4576,22.4672,22.4713,22.4716,22.4699,22.4682,22.4682,22.4708,22.4723,22.4734,22.4755,22.4803,22.4892,22.5038,22.5254,22.5526,22.5838,22.6169,22.6503,22.6821,22.7117,22.7419,22.7723,22.8022,22.8311,22.8583,22.8831,22.9041,22.9221,22.9389,22.9565,22.9765,23.0007,23.0298,23.0619,23.0967,23.1338,23.173000000000002,23.2141,23.256999999999998,23.3047,23.355999999999998,23.4087,23.4605,23.5092,23.5527,23.590999999999998,23.6261,23.6585,23.6884,23.7162,23.7425,23.7675,23.791,23.8126,23.8322,23.8497,23.8648,23.8775,23.8868,23.8929,23.8969,23.8996,23.9019,23.9047,23.9091,23.9155,23.9222,23.9278,23.9306,23.9291,23.9216,23.9074,23.888,23.8652,23.8408,23.8167,23.7946,23.7723,23.7465,23.7201,23.6962,23.6779,23.6683,23.6701,23.6831,23.7044,23.7314,23.7615,23.791999999999998,23.8202,23.8491,23.8808,23.9135,23.9455,23.9753,24.0011,24.0219,24.0389,24.0531,24.0651,24.0758,24.0858,24.0959,24.1057,24.1147,24.1228,24.1296,24.135,24.1385,24.1407,24.1421,24.1421,24.1402,24.1359,24.1286,24.1181,24.1059,24.0915,24.0743,24.0533,24.0279,23.9973,23.9569,23.9075,23.8537,23.8001,23.7514,23.7122,23.6851,23.6658,23.6527,23.6445,23.6399,23.6377,23.6373,23.6492,23.6705,23.6934,23.71,23.7123,23.6925,23.6479,23.5851,23.5076,23.4186,23.3216,23.2198,23.1161,23.0082,22.8943,22.773000000000003,22.643,22.5029,22.3511,22.1828,21.999000000000002,21.8052,21.6069,21.4093,21.218000000000004,21.0443,20.8991,20.7642,20.6198,20.4463,20.2238,19.9333,19.5738,19.160999999999998,18.7105,18.2377,17.7581,17.2874,16.7991,16.2599,15.7052,15.1706,14.692,14.3052,14.0449,13.9138,13.8759,13.8932,13.9274,13.9404,13.8942,13.7781,13.6209,13.4505,13.2947,13.1816,13.1391,13.1895,13.3198,13.5072,13.7292,13.9629,14.186,14.3826,14.6315,14.922,15.2031,15.4237,15.533,15.4801,15.2113,14.7454,14.1533,13.5061,12.875,12.3311,11.9253,11.5812,11.2806,11.0223,10.8054,10.6286,10.4922,10.4288,10.4321,10.4733,10.5239,10.555,10.538,10.4532,10.3178,10.1538,9.9829,9.8271,9.708,9.6475,9.6524,9.7008,9.7676,9.8281,9.8572,9.8301,9.74,9.6059,9.442,9.2623,9.0808,8.9116,8.7596,8.5999,8.4377,8.2819,8.1418,8.0265,7.9455,7.9088,7.9057,7.9208,7.9388,7.9442,7.9216,7.8625,7.7771,7.6770000000000005,7.5736,7.4785,7.4029,7.3559,7.3274,7.313,7.3101,7.316,7.3281,7.3441,7.3734,7.4177,7.468999999999999,7.5193,7.5604,7.5844,7.5863,7.5715,7.5452,7.5126,7.4788,7.4489,7.4270000000000005,7.4071,7.3879,7.3701,7.3544,7.3415,7.3321,7.3276,7.3276,7.3304,7.3347,7.3388,7.3411,7.3401,7.3363,7.3312,7.3266,7.3242,7.3256,7.3322,7.3403,7.3498,7.3628,7.3813,7.4071,7.4422,7.4887,7.5456,7.6104,7.6807,7.7537,7.8271,7.9001,7.9777,8.0587,8.1406,8.2212,8.2983,8.3696,8.434,8.4933,8.55,8.6065,8.6651,8.7283,8.7978,8.8719,8.949,9.0272,9.1047,9.1796,9.2507,9.3195,9.3866,9.4525,9.5173,9.5814,9.645,9.7063,9.765,9.8229,9.8817,9.943,10.0084,10.079,10.154,10.2319,10.3117,10.392000000000001,10.4717,10.55,10.6294,10.7097,10.7896,10.868,10.9437,11.0154,11.0824,11.1455,11.2062,11.2657,11.3254,11.3868,11.4504,11.5152,11.5806,11.6462,11.7116,11.7763,11.8402,11.9041,11.9678,12.0311,12.0934,12.1544,12.2137,12.2712,12.3274,12.3822,12.4359,12.4884,12.5399,12.5894,12.6351,12.6787,12.7224,12.7683,12.8186,12.8753,12.9382,13.0057,13.0765,13.149000000000001,13.2218,13.2935,13.367,13.4443,13.5225,13.5985,13.6697,13.732999999999999,13.7864,13.8323,13.8719,13.9061,13.936,13.9624,13.9861,14.0037,14.0158,14.0245,14.0319,14.0403,14.0518,14.0651,14.0783,14.092,14.1071,14.1244,14.1446,14.1686,14.1966,14.2275,14.2603,14.2939,14.3273,14.3596,14.3936,14.4291,14.4646,14.4983,14.5285,14.5538,14.5736,14.5895,14.602,14.6113,14.6179,14.6222,14.6235,14.6197,14.6123,14.6032,14.5944,14.5879,14.5856,14.5864,14.5892,14.5934,14.5984,14.6033,14.6076,14.6109,14.6136,14.6162,14.6194,14.6235,14.6293,14.6372,14.6477,14.6598,14.6727,14.6853,14.6968,14.7064,14.7146,14.7221,14.7287,14.7347,14.7401,14.7449,14.7491,14.7527,14.7557,14.758,14.7597,14.7607,14.7612,14.7612,14.7607,14.7595,14.7573,14.7539,14.7493,14.7428,14.7348,14.7258,14.7165,14.7074,14.6991,14.6921,14.6861,14.6804,14.6741,14.6666,14.657,14.6446,14.6291,14.6117,14.5937,14.5761,14.5602,14.5471,14.5368,14.5282,14.5206,14.5134,14.5057,14.4969,14.4888,14.4825,14.475999999999999,14.4674,14.4547,14.436,14.409,14.3732,14.3317,14.2877,14.2441,14.2043,14.1707,14.1397,14.1106,14.0838,14.0595,14.0382,14.0203,14.0084,14.0022,13.9989,13.9957,13.9899,13.9786,13.9596,13.9344,13.9054,13.8753,13.8467,13.8222,13.8038,13.789000000000001,13.7769,13.7672,13.7596,13.7538,13.7495,13.7464,13.7447,13.7448,13.7474,13.7528,13.7615,13.7736,13.7885,13.8063,13.8271,13.850999999999999,13.8781,13.9093,13.9473,13.9901,14.035,14.0792,14.1198,14.1541,14.1814,14.204,14.2241,14.244000000000002,14.2659,14.2921,14.3235,14.3584,14.3955,14.4337,14.4717,14.5083,14.5424,14.574000000000002,14.6043,14.6348,14.6668,14.7018,14.7411,14.7835,14.8284,14.8758,14.9253,14.977,15.0307,15.0883,15.1506,15.2152,15.28,15.3426,15.401,15.454,15.5039,15.5512,15.5961,15.6389,15.6801,15.7192,15.752,15.7803,15.8079,15.8382,15.8749,15.9216,15.9987,16.1027,16.2116,16.3036,16.3569,16.3494,16.2809,16.1738,16.0278,15.8427,15.6178,15.3528,15.0248,14.5695,14.0412,13.5062,13.0307,12.6808,12.5224,12.577,12.7852,13.079,13.3903,13.651,13.7931,13.8262,13.8091,13.7476,13.6476,13.5148,13.3551,13.1467,12.8387,12.4779,12.1172,11.8092,11.6067,11.5562,11.6288,11.7947,12.0337,12.3255,12.6501,12.9881,13.4271,13.9788,14.5653,15.1084,15.5302,15.7526,15.712,15.4488,15.0469,14.5901,14.1624,13.8478,13.6971,13.6198,13.5991,13.6305,13.7093,13.831,13.9987,14.3048,14.7182,15.1606,15.5542,15.8208,15.8824,15.6709,15.2345,14.6694,14.0716,13.5371,13.1622,13.0078,13.0009,13.0939,13.2435,13.4062,13.5388,13.6277,13.7968,14.0043,14.1771,14.2423,14.1269,13.7544,12.9939,11.9278,10.7193,9.5316,8.527999999999999,7.8716,7.6147,7.6216,7.8263,8.1638,8.5692,8.9775,9.4023,9.9929,10.6723,11.3483,11.9289,12.3219,12.4408,12.2977,11.9645,11.5106,11.0054,10.5182,10.1176,9.786,9.4721,9.162,8.8415,8.4964,8.1128,7.6598,7.1327,6.5727,6.0213,5.5202,5.1109,4.8289,4.6591,4.5683,4.5239,4.4934,4.4443,4.3465,4.217,4.0748,3.929,3.7889,3.6637,3.5627,3.4928,3.4471,3.4146,3.3842,3.3449,3.2857,3.1984,3.0891,2.9671,2.8418,2.7224,2.6183,2.5341,2.4571,2.3878,2.3286,2.2819,2.25,2.2359999999999998,2.2491,2.2839,2.3306,2.3791,2.4193,2.4416,2.4462,2.4407,2.4288,2.4142,2.401,2.3928,2.3881,2.3799,2.3721,2.3692,2.3756,2.3958,2.4345,2.4936,2.5666,2.6469,2.7275,2.8016,2.8633,2.9206,2.9758,3.0267,3.0711,3.1068,3.1317,3.1408,3.1358,3.1226,3.1073,3.0957,3.0939,3.105,3.1242,3.1486,3.1754,3.2018,3.2248,3.2436,3.2635,3.283,3.3,3.3124,3.3181,3.3145,3.2949,3.2635,3.2279,3.1956,3.174,3.1706,3.1874,3.2188,3.2595,3.3043,3.3479,3.3851,3.4145,3.4409,3.4657,3.4902,3.5159,3.5442,3.5755,3.6072,3.6401,3.6751,3.7134,3.7560000000000002,3.8046,3.8639,3.9304,3.9991,4.0647,4.1221,4.1662,4.1972,4.2186,4.2336,4.2454,4.2568,4.2712,4.2878,4.303,4.3179,4.3334,4.3504,4.3698,4.3933,4.4221,4.4536,4.4852,4.5141,4.5377,4.5535,4.5624,4.5663,4.5673,4.5673,4.5682,4.5717,4.5729,4.5716,4.571000000000001,4.5746,4.5858,4.6080000000000005,4.6432,4.6894,4.743,4.801,4.8599,4.9166,4.971,5.0279,5.0858,5.143,5.1979,5.2488,5.2944,5.3347,5.3715,5.4063,5.4407,5.4762,5.5145,5.5568,5.6011,5.6451,5.6865,5.7228,5.7518,5.7703,5.7801,5.7855,5.7905,5.7994,5.8161,5.8422,5.8742,5.9103,5.949,5.9886,6.0275,6.0657,6.1069,6.1493,6.1909,6.2297,6.2635,6.2901,6.308,6.3201,6.33,6.3411,6.357,6.3812,6.415,6.4552,6.4979,6.5395,6.5759,6.6033,6.6209,6.6315,6.6377,6.6422,6.6476,6.6566,6.6687,6.681,6.6941,6.709,6.7263,6.7468,6.7729,6.8072,6.8458,6.8845,6.9189,6.9447,6.9575,6.9547,6.9414,6.9235,6.9073,6.8987,6.9037,6.9222,6.9497,6.9828,7.018,7.0518,7.0809,7.1076,7.1353,7.1621,7.1859,7.2048,7.2169,7.218999999999999,7.2104,7.1954,7.1785,7.1643,7.1571,7.1605,7.1724,7.1897,7.2095,7.2291,7.2455,7.2561,7.2617,7.2643,7.2657,7.2677,7.272,7.2802,7.291,7.3034,7.3175,7.3333,7.3509,7.3702,7.3937,7.4214,7.4506,7.479,7.504,7.5232,7.5374,7.5501,7.5595,7.5641,7.5623,7.5524,7.5312,7.4957,7.4513,7.4037,7.3587,7.3221,7.297999999999999,7.2795,7.2658,7.2575,7.2552,7.2594,7.2711,7.296,7.3312,7.3716,7.4117,7.4461,7.4696,7.484,7.4932,7.4977,7.4979,7.4944,7.4878,7.4751,7.4542,7.428999999999999,7.4036,7.3817,7.3674,7.364,7.37,7.3814,7.3939,7.4035,7.4061,7.3994,7.3889,7.3745,7.3554,7.3307,7.2997,7.2607,7.2086,7.1468,7.0809,7.0163,6.9585,6.9129,6.877000000000001,6.8473,6.8229999999999995,6.803,6.7864,6.7723,6.7651,6.7653,6.7688,6.7716,6.7695,6.7584,6.7363,6.7061,6.6705,6.632000000000001,6.5934,6.5572,6.5237,6.4883,6.4525,6.4185,6.3882,6.3639,6.3473,6.3376,6.3334,6.3334,6.3363,6.3408,6.3464,6.3588,6.3759,6.3938,6.4087,6.4164,6.4134,6.4017,6.3839,6.3602,6.3306,6.2955,6.2551,6.2059,6.1468,6.082000000000001,6.0154,5.9511,5.893,5.8399,5.787000000000001,5.7363,5.6897,5.6492,5.6167,5.5945,5.5829,5.5789,5.5796,5.5818,5.5827,5.5815,5.5846,5.5897,5.5936,5.5928,5.5841,5.5641,5.5319,5.4907,5.4443,5.3967,5.3515,5.3122,5.2744,5.2364,5.2002,5.1678,5.1412,5.1225,5.1155,5.1184,5.1266,5.1356,5.1406,5.1372,5.1241,5.1054,5.0825,5.0565,5.0287,5.0003,4.9692,4.9315,4.8912,4.8523,4.8189,4.7951,4.7847,4.7865,4.7968,4.8122,4.8289,4.8433,4.8529,4.8614,4.8696,4.8775,4.8849,4.8918,4.8981,4.9039,4.9091,4.9139,4.9183,4.9223,4.9261,4.9314,4.9375,4.9431,4.9465,4.9461,4.9404,4.9316,4.9208,4.9065,4.8871,4.8612,4.8273,4.7818,4.7242,4.6593,4.5918,4.5266,4.4686,4.418,4.3689,4.3225,4.2803,4.2441,4.2154,4.1968,4.1906,4.1923,4.1972,4.2007,4.1981,4.1852,4.1633,4.1361,4.1069,4.0793,4.0568,4.0425,4.0349,4.0319,4.0318,4.0331,4.0341,4.0337,4.0368,4.0427,4.0481,4.0497,4.0444,4.0287,3.9979,3.9546,3.9052,3.8560000000000003,3.8134,3.7839,3.7686,3.7625,3.763,3.7672,3.7725,3.7761,3.7794,3.7861,3.7939,3.8007,3.8042,3.8024,3.7962,3.7897,3.7804,3.7656,3.7426,3.7085,3.6554,3.5676,3.4619,3.3582,3.2760000000000002,3.2353,3.2543,3.3302,3.4461,3.585,3.7295,3.8628,3.9718,4.0813,4.192,4.2959,4.3846,4.45,4.4828,4.4637,4.4069,4.3359,4.2739,4.2445,4.2704,4.3431,4.4478,4.5786,4.7297,4.8952,5.0694,5.2592,5.4685,5.6927,5.9272,6.1674,6.4086,6.6571,6.9182,7.1853,7.4523,7.7126,7.9599,8.1912,8.412,8.6245,8.8313,9.0346,9.2367,9.4348,9.6191,9.7975,9.9791,10.1729,10.3879,10.6375,10.9342,11.2568,11.5814,11.8839,12.1405,12.3332]}";
-    String requestBody = String.format("{\"input\":[%s]}", data);
-    OutputStream os = connection.getOutputStream();
-    OutputStreamWriter osw = new OutputStreamWriter(os, "UTF-8");
-    osw.write(requestBody);
-    osw.flush();
-    osw.close();
-    os.close();
-    connection.connect();
-    int responseCode = connection.getResponseCode();
-
-    if (responseCode == HttpURLConnection.HTTP_OK) {
-      StringBuilder sb = new StringBuilder();
-      Scanner scanner = new Scanner(connection.getInputStream());
-      while (scanner.hasNext()) {
-        sb.append(scanner.nextLine());
+    String stored = body.toString();
+    if (stored.length() > MAX_RESULT_CHARS) {
+      try {
+        stored = objectMapper.writeValueAsString(prediction);
+      } catch (JsonProcessingException e) {
+        throw HttpErrors.status(502, "ML service returned an invalid inference response");
       }
-      scanner.close();
+      if (stored.length() > MAX_RESULT_CHARS) {
+        throw HttpErrors.status(502, "ML service returned an oversized inference response");
+      }
+    }
+    inferenceRepository.recordInference(callerId, modelId, stored);
+    return prediction;
+  }
 
-      ObjectMapper objectMapper = new ObjectMapper();
-      Prediction prediction = objectMapper.readValue(String.valueOf(sb), Prediction.class);
-
-      Inferences inference = new Inferences();
-      inference.setResult(String.valueOf(sb));
-      inferenceRepository.addInference(user_id, model_id, inference);
-
-      return prediction;
-    } else {
-      throw new CustomException("Inference seems not working at all!");
+  private static void validateNdim(int ndim) {
+    if (ndim < 0 || ndim > MAX_NDIM) {
+      throw HttpErrors.badRequest("pca_dim must be between 0 and " + MAX_NDIM);
     }
   }
 
-  public <T> T objectMapping(InputStream inputStream, Class<T> valueType)
-      throws JsonMappingException, JsonProcessingException {
-    StringBuilder sb = new StringBuilder();
-    Scanner scanner = new Scanner(inputStream);
-    while (scanner.hasNext()) {
-      sb.append(scanner.nextLine());
+  /** Loads the model (404 if missing) and derives validated path segments for the ML service. */
+  private ModelTarget resolveModel(long modelId) {
+    Models model = modelRepository.findByIdOptional(modelId)
+        .orElseThrow(() -> HttpErrors.notFound("Model not found"));
+
+    if (model.getUser() == null || model.getUser().getId() == null) {
+      throw HttpErrors.status(409, "Model has no owner");
     }
-    scanner.close();
-    ObjectMapper objectMapper = new ObjectMapper();
-    return objectMapper.readValue(String.valueOf(sb), valueType);
+    String type = model.getType();
+    if (type == null || !MODEL_TYPE.matcher(type).matches()) {
+      throw HttpErrors.status(409, "Model has an invalid type");
+    }
+    String name = modelName(model.getFilepath());
+    if (name == null || !MODEL_NAME.matcher(name).matches()) {
+      throw HttpErrors.status(409, "Model has an invalid file name");
+    }
+    return new ModelTarget(model.getUser().getId(), type, name);
   }
 
-  @Data
-  private static class ErrorResponse {
-    private String error;
-    private String message;
+  /** File name of the stored model without directories and without its extension. */
+  static String modelName(String filepath) {
+    if (filepath == null || filepath.isBlank()) {
+      return null;
+    }
+    int slash = Math.max(filepath.lastIndexOf('/'), filepath.lastIndexOf('\\'));
+    String fileName = filepath.substring(slash + 1);
+    return fileName.replaceFirst("[.][^.]+$", "");
   }
 
-  @Data
-  private static class Prediction {
-    private String message;
-    private Result result;
+  /** Invokes the ML service and maps transport/upstream failures to 502/503/504. */
+  private <T> T callUpstream(String operation, Supplier<T> call) {
+    try {
+      return call.get();
+    } catch (WebApplicationException e) {
+      int status = e.getResponse() != null ? e.getResponse().getStatus() : -1;
+      LOG.warnf("%s: ML service returned HTTP %d%s", operation, status, upstreamBody(e));
+      throw HttpErrors.status(502, operation + " failed: ML service returned HTTP " + status);
+    } catch (ProcessingException e) {
+      if (hasCause(e, true)) {
+        LOG.warnf("%s: ML service timed out: %s", operation, e.getMessage());
+        throw HttpErrors.status(504, operation + " failed: ML service timed out");
+      }
+      if (hasCause(e, false)) {
+        LOG.warnf("%s: ML service unreachable: %s", operation, e.getMessage());
+        throw HttpErrors.status(503, operation + " failed: ML service is unavailable");
+      }
+      LOG.warnf(e, "%s: ML service call failed", operation);
+      throw HttpErrors.status(502, operation + " failed: invalid response from ML service");
+    } catch (RuntimeException e) {
+      LOG.warnf(e, "%s: ML service call failed", operation);
+      throw HttpErrors.status(502, operation + " failed: invalid response from ML service");
+    }
   }
 
-  @Data
-  private static class Result {
-    @JsonProperty("N")
-    private double N;
-    @JsonProperty("P")
-    private double P;
-    @JsonProperty("K")
-    private double K;
-    private Metrics metrics;
+  /** {@code timeout=true}: any timeout in the cause chain; otherwise a connect/resolve failure. */
+  private static boolean hasCause(Throwable error, boolean timeout) {
+    Throwable t = error;
+    for (int depth = 0; t != null && depth < 16; depth++, t = t.getCause()) {
+      if (timeout) {
+        if (t instanceof java.util.concurrent.TimeoutException
+            || t instanceof java.net.SocketTimeoutException
+            || t.getClass().getSimpleName().contains("Timeout")) {
+          return true;
+        }
+      } else if (t instanceof java.net.ConnectException
+          || t instanceof java.net.UnknownHostException
+          || t instanceof java.nio.channels.UnresolvedAddressException) {
+        return true;
+      }
+    }
+    return false;
   }
 
-  @Data
-  private static class Metrics {
-    private double mse;
-    private double r2;
+  private static String upstreamBody(WebApplicationException e) {
+    try {
+      if (e.getResponse() != null && e.getResponse().hasEntity()) {
+        String body = e.getResponse().readEntity(String.class);
+        if (body != null && !body.isEmpty()) {
+          return ": " + (body.length() > 500 ? body.substring(0, 500) + "..." : body);
+        }
+      }
+    } catch (RuntimeException ignored) {
+      // entity already consumed or unreadable
+    }
+    return "";
   }
 
-  @Data
-  private static class Training {
-    private String message;
-    private String result;
+  private record ModelTarget(long owner, String type, String name) {
   }
 }

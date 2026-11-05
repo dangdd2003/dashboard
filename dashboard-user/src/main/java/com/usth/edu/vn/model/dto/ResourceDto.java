@@ -11,6 +11,7 @@ public class ResourceDto {
 
   private Long id;
 
+  /** Path relative to the storage root (never an absolute server path). */
   private String filepath;
 
   private String type;

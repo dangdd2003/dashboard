@@ -1,0 +1,7 @@
+# Docker build context is this module directory (quarkus-container-image-docker);
+# only the packaged application is needed.
+*
+!target/*-runner
+!target/*-runner.jar
+!target/lib/*
+!target/quarkus-app/*

@@ -3,26 +3,22 @@ package com.usth.edu.vn.validation;
 import jakarta.validation.ConstraintValidator;
 import jakarta.validation.ConstraintValidatorContext;
 
-import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+/**
+ * Validates e-mail addresses. {@code null} is considered valid (combine with {@code @NotNull}/{@code @NotBlank}).
+ * The compiled {@link Pattern} is immutable and thread-safe; matchers are created per call.
+ */
 public class EmailValidator implements ConstraintValidator<ValidEmail, String> {
-    private Pattern pattern;
 
-    private Matcher matcher;
+  private static final Pattern EMAIL_PATTERN = Pattern.compile(
+      "^(?=.{1,64}@)[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*@[^-][A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)*(\\.[A-Za-z]{2,})$");
 
-    private static final String EMALL_PATTERN = "^(?=.{1,64}@)[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*@[^-][A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)*(\\.[A-Za-z]{2,})$";
-
-    @Override
-    public void initialize(ValidEmail constrainAnnotation) {
-        ConstraintValidator.super.initialize(constrainAnnotation);
-
+  @Override
+  public boolean isValid(String email, ConstraintValidatorContext constraintValidatorContext) {
+    if (email == null) {
+      return true;
     }
-
-    @Override
-    public boolean isValid(String email, ConstraintValidatorContext constraintValidatorContext) {
-        pattern = Pattern.compile(EMALL_PATTERN);
-        matcher = pattern.matcher(email);
-        return matcher.matches();
-    }
+    return EMAIL_PATTERN.matcher(email).matches();
+  }
 }

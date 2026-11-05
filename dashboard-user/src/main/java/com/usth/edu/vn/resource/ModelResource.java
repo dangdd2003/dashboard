@@ -1,17 +1,21 @@
 package com.usth.edu.vn.resource;
 
-import java.io.File;
+import static com.usth.edu.vn.services.FileName.MODELS;
+
 import java.io.IOException;
+import java.net.URI;
+import java.util.Date;
 import java.util.List;
 
 import org.jboss.resteasy.reactive.RestForm;
 import org.jboss.resteasy.reactive.multipart.FileUpload;
 
-import com.usth.edu.vn.exception.CustomException;
 import com.usth.edu.vn.model.Models;
+import com.usth.edu.vn.model.Users;
 import com.usth.edu.vn.model.dto.ModelDto;
+import com.usth.edu.vn.model.dto.ModelUpdateRequest;
 import com.usth.edu.vn.repository.ModelRepository;
-import com.usth.edu.vn.repository.RatingRepository;
+import com.usth.edu.vn.security.CurrentUser;
 import com.usth.edu.vn.services.FileServices;
 
 import jakarta.annotation.security.PermitAll;
@@ -19,11 +23,27 @@ import jakarta.annotation.security.RolesAllowed;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.transaction.Transactional;
-import jakarta.ws.rs.*;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
+import jakarta.ws.rs.BadRequestException;
+import jakarta.ws.rs.Consumes;
+import jakarta.ws.rs.DELETE;
+import jakarta.ws.rs.DefaultValue;
+import jakarta.ws.rs.GET;
+import jakarta.ws.rs.NotFoundException;
+import jakarta.ws.rs.POST;
+import jakarta.ws.rs.PUT;
+import jakarta.ws.rs.Path;
+import jakarta.ws.rs.PathParam;
+import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
-
-import static jakarta.ws.rs.core.Response.Status.*;
 
 @Path("/models")
 @ApplicationScoped
@@ -35,10 +55,10 @@ public class ModelResource {
   ModelRepository modelRepository;
 
   @Inject
-  RatingRepository ratingRepository;
+  FileServices fileServices;
 
   @Inject
-  FileServices fileServices;
+  CurrentUser currentUser;
 
   @GET
   @Path("/")
@@ -51,114 +71,135 @@ public class ModelResource {
   @GET
   @Path("{id}")
   @PermitAll
-  public Response getModelById(long id) {
-    ModelDto model = modelRepository.findModelById(id);
-    return Response.ok(model).build();
+  public Response getModelById(@PathParam("id") long id) {
+    return Response.ok(modelRepository.findModelById(id)).build();
   }
 
   @GET
   @Path("/paging")
   @PermitAll
-  public Response getPagingModels(@QueryParam("pageNo") int pageNo, @QueryParam("pageSize") int pageSize) {
-    List<ModelDto> allModels = modelRepository.findPagingModels(pageNo, pageSize);
-    // if (allModels.isEmpty()) {
-    // return Response.status(BAD_REQUEST).build();
-    // }
-    return Response.ok(allModels).build();
+  public Response getPagingModels(
+      @QueryParam("pageNo") @DefaultValue("1") @Min(1) int pageNo,
+      @QueryParam("pageSize") @DefaultValue("20") @Min(1) @Max(100) int pageSize) {
+    return Response.ok(modelRepository.findPagingModels(pageNo, pageSize)).build();
   }
 
   @GET
   @Path("/search/{keyword}")
   @PermitAll
-  public Response getSearchModels(String keyword) {
-    List<ModelDto> allModels = modelRepository.findMatchedModels(keyword);
-    // if (allModels.isEmpty()) {
-    // return Response.status(BAD_REQUEST).build();
-    // }
-    return Response.ok(allModels).build();
+  public Response getSearchModels(@PathParam("keyword") String keyword) {
+    return Response.ok(modelRepository.findMatchedModels(keyword)).build();
   }
 
   @GET
   @Path("/models-by-user")
   @PermitAll
-  public Response getModelsByUser(@QueryParam("user_id") long user_id) {
-    List<ModelDto> allModels = modelRepository.findModelsByUser(user_id);
-    return Response.ok(allModels).build();
+  public Response getModelsByUser(@QueryParam("user_id") @NotNull Long userId) {
+    return Response.ok(modelRepository.findModelsByUser(userId)).build();
   }
 
   @GET
   @Path("/top10-recently-use")
   @PermitAll
   public Response getTopTenRecentlyCreatedModels() {
-    List<ModelDto> top10Models = modelRepository.findTopTenRecentlyCreatedModels();
-    return Response.ok(top10Models).build();
+    return Response.ok(modelRepository.findTopTenRecentlyCreatedModels()).build();
   }
 
   @GET
   @Path("/top10-most-use")
   @PermitAll
   public Response getTopTenMostUsedModels() {
-    List<ModelDto> top10Models = modelRepository.findTopTenMostUsedModels();
-    return Response.ok(top10Models).build();
+    return Response.ok(modelRepository.findTopTenMostUsedModels()).build();
   }
 
   @GET
   @Path("/top10-best-rating")
   @PermitAll
   public Response getTopTenBestRatingModels() {
-    List<ModelDto> top10Models = modelRepository.findTop10BestRatingModels();
-    return Response.ok(top10Models).build();
+    return Response.ok(modelRepository.findTop10BestRatingModels()).build();
   }
 
   @GET
   @Path("/count")
   @PermitAll
   public Response getModelCount() {
-    long count = modelRepository.count();
-    return Response.ok(count).build();
+    return Response.ok(modelRepository.count()).build();
   }
 
+  /**
+   * Uploads a model owned by the caller. Multipart form fields:
+   * {@code model} (file), {@code name}, {@code type}, {@code description} (optional).
+   */
   @POST
   @Path("/create")
-  // @RolesAllowed({ "admin", "user" })
-  @PermitAll
+  @RolesAllowed({ "admin", "user" })
   @Transactional
   @Consumes(MediaType.MULTIPART_FORM_DATA)
   public Response createModel(
-      @QueryParam("user_id") long user_id,
-      @QueryParam("name") String name,
-      @QueryParam("type") String type,
-      @QueryParam("description") String description,
-      @RestForm("model") FileUpload input)
-      throws IOException, CustomException {
+      @RestForm("name") @NotBlank @Size(max = 255) String name,
+      @RestForm("type") @NotNull @Pattern(regexp = ModelUpdateRequest.TYPE_REGEX, message = "must match "
+          + ModelUpdateRequest.TYPE_REGEX) String type,
+      @RestForm("description") @Size(max = 65535) String description,
+      @RestForm("model") FileUpload file)
+      throws IOException {
+    if (file == null) {
+      throw new BadRequestException("Missing file part 'model'");
+    }
+    Users owner = currentUser.user();
+    String relativePath = fileServices.uploadFile(owner.getId(), file, MODELS, type);
+
     Models model = new Models();
-    model.setName(name);
+    model.setName(name.strip());
     model.setType(type);
     model.setDescription(description);
-    modelRepository.addModel(user_id, model, input);
-    if (modelRepository.isPersistent(model)) {
-      return Response.status(CREATED).build();
-    }
-    return Response.status(BAD_REQUEST).build();
+    model.setFilepath(relativePath);
+    model.setUser(owner);
+    model.setCreateTime(new Date());
+    modelRepository.persist(model);
+
+    return Response.created(URI.create("/models/" + model.getId()))
+        .entity(modelRepository.findModelById(model.getId()))
+        .build();
   }
 
+  /** Updates name/type/description of a model; owner or admin only. Returns the updated model. */
   @PUT
   @Path("/update")
   @RolesAllowed({ "admin", "user" })
   @Transactional
-  public Response updateModel(@QueryParam("id") long model_id, Models model) throws CustomException {
-    modelRepository.updateModel(model_id, model);
-    return Response.status(ACCEPTED).entity(model).build();
+  public Response updateModel(@QueryParam("id") @NotNull Long id, @Valid @NotNull ModelUpdateRequest request) {
+    Models model = modelRepository.findByIdOptional(id)
+        .orElseThrow(() -> new NotFoundException("Model " + id + " not found"));
+    currentUser.requireOwnerOrAdmin(model.getUser() == null ? null : model.getUser().getId());
+
+    if (request.name() != null) {
+      model.setName(request.name().strip());
+    }
+    if (request.type() != null) {
+      model.setType(request.type());
+    }
+    if (request.description() != null) {
+      model.setDescription(request.description());
+    }
+    return Response.ok(modelRepository.findModelById(id)).build();
   }
 
+  /** Deletes a model with its ratings and inferences; the stored file is removed after commit. */
   @DELETE
   @Path("/delete/{id}")
-  @PermitAll
+  @RolesAllowed({ "admin", "user" })
   @Transactional
   @Produces(MediaType.TEXT_PLAIN)
-  public Response deleteModel(long id) {
-    fileServices.deleteDir(new File(modelRepository.getModelById(id).getFilepath()));
-    modelRepository.deleteModel(id);
+  public Response deleteModel(@PathParam("id") long id) {
+    Models model = modelRepository.findByIdOptional(id)
+        .orElseThrow(() -> new NotFoundException("Model " + id + " not found"));
+    currentUser.requireOwnerOrAdmin(model.getUser() == null ? null : model.getUser().getId());
+
+    String filepath = model.getFilepath();
+    modelRepository.deleteModelCascade(model);
+    if (filepath != null && !filepath.isBlank()) {
+      fileServices.deleteStoredFileAfterCommit(filepath);
+    }
     return Response.ok("Model " + id + " is deleted!").build();
   }
 }

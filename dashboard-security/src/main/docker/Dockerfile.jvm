@@ -1,0 +1,31 @@
+####
+# Dockerfile used by quarkus-container-image-docker to build the JVM image of dashboard-security.
+#
+# Build it from the repository root with:
+#
+#   ./mvnw -B clean package -DskipTests -Dquarkus.container-image.build=true
+#
+# which produces the image dashboard/dashboard-security:1.0-SNAPSHOT.
+#
+# Runtime configuration (see application.properties): DB_URL, DB_USER, DB_PASSWORD, JWT_KEY_DIR
+# (must contain sign-private.pem and enc-public.pem), CORS_ORIGINS, JWT_LIFESPAN.
+#
+# You can find more information about the UBI base runtime images and their configuration here:
+# https://rh-openjdk.github.io/redhat-openjdk-containers/
+###
+FROM registry.access.redhat.com/ubi9/openjdk-21-runtime:1.23
+
+ENV LANGUAGE='en_US:en'
+
+# We make four distinct layers so if there are application changes the library layers can be re-used
+COPY --chown=185 target/quarkus-app/lib/ /deployments/lib/
+COPY --chown=185 target/quarkus-app/*.jar /deployments/
+COPY --chown=185 target/quarkus-app/app/ /deployments/app/
+COPY --chown=185 target/quarkus-app/quarkus/ /deployments/quarkus/
+
+EXPOSE 8080
+USER 185
+ENV JAVA_OPTS_APPEND="-Dquarkus.http.host=0.0.0.0 -Djava.util.logging.manager=org.jboss.logmanager.LogManager"
+ENV JAVA_APP_JAR="/deployments/quarkus-run.jar"
+
+ENTRYPOINT [ "/opt/jboss/container/java/run/run-java.sh" ]
