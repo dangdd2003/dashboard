@@ -1,39 +1,35 @@
 package com.usth.edu.vn.exception;
 
+import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.ext.ExceptionMapper;
 import jakarta.ws.rs.ext.Provider;
 
 import static jakarta.ws.rs.core.Response.Status.BAD_REQUEST;
+import static jakarta.ws.rs.core.Response.Status.CONFLICT;
 import static jakarta.ws.rs.core.Response.Status.NOT_FOUND;
 
-import jakarta.ws.rs.core.MediaType;
-
+/**
+ * Maps {@link CustomException}: USER_NOT_FOUND -> 404, USER_EXISTED -> 409, everything else -> 400.
+ */
 @Provider
 public class CustomExceptionHandler implements ExceptionMapper<CustomException> {
 
-    @Override
-    public Response toResponse(CustomException e) {
-        if (e.getMessage().equals(ExceptionType.USER_NOT_FOUND)) {
-            return Response.status(NOT_FOUND)
-                    .entity("User not found!")
-                    .type(MediaType.TEXT_PLAIN)
-                    .build();
-        } else if (e.getMessage().equals(ExceptionType.USER_EXISTED)) {
-            return Response.status(BAD_REQUEST)
-                    .entity("User is already existed!")
-                    .type(MediaType.TEXT_PLAIN)
-                    .build();
-        } else if (e.getMessage().equals(ExceptionType.INCORRECT_PASSWORD)){
-            return Response.status(BAD_REQUEST)
-                    .entity("Password is not matched!")
-                    .type(MediaType.TEXT_PLAIN)
-                    .build();
-        } else {
-            return Response.status(BAD_REQUEST)
-                    .entity(e.getMessage())
-                    .type(MediaType.TEXT_PLAIN)
-                    .build();
-        }
-    }
+  @Override
+  public Response toResponse(CustomException e) {
+    String message = e.getMessage() == null ? "" : e.getMessage();
+    return switch (message) {
+      case ExceptionType.USER_NOT_FOUND -> text(NOT_FOUND, "User not found!");
+      case ExceptionType.USER_EXISTED -> text(CONFLICT, "User is already existed!");
+      case ExceptionType.INCORRECT_PASSWORD -> text(BAD_REQUEST, "Password is not matched!");
+      default -> text(BAD_REQUEST, message);
+    };
+  }
+
+  private static Response text(Response.Status status, String body) {
+    return Response.status(status)
+        .entity(body)
+        .type(MediaType.TEXT_PLAIN)
+        .build();
+  }
 }

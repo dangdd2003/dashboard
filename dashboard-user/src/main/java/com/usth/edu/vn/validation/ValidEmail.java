@@ -3,20 +3,25 @@ package com.usth.edu.vn.validation;
 import jakarta.validation.Constraint;
 import jakarta.validation.Payload;
 
+import java.lang.annotation.Documented;
 import java.lang.annotation.ElementType;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
+@Documented
 @Retention(RetentionPolicy.RUNTIME)
 @Target({
-    ElementType.FIELD
+    ElementType.FIELD,
+    ElementType.METHOD,
+    ElementType.PARAMETER,
+    ElementType.ANNOTATION_TYPE
 })
 @Constraint(validatedBy = EmailValidator.class)
 public @interface ValidEmail {
-    String message() default "Email is not valid!";
+  String message() default "Email is not valid!";
 
-    Class<? extends Payload>[] payload() default {};
+  Class<? extends Payload>[] payload() default {};
 
-    Class<?>[] groups() default {};
+  Class<?>[] groups() default {};
 }

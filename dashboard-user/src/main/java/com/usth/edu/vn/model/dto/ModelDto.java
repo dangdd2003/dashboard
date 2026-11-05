@@ -6,6 +6,13 @@ import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+/**
+ * Model read model. Field order is the constructor order used by the
+ * {@code SELECT NEW} query in {@code ModelRepository} — keep them in sync.
+ * <p>
+ * {@code stars} is the average rating (null when the model has no ratings),
+ * {@code usageCount} the number of inferences run with the model.
+ */
 @Data
 @AllArgsConstructor
 @NoArgsConstructor
@@ -17,6 +24,7 @@ public class ModelDto {
 
   private String type;
 
+  /** Stored file path, relative to the storage root. */
   private String filepath;
 
   private String description;

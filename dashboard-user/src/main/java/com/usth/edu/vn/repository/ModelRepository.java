@@ -1,377 +1,128 @@
 package com.usth.edu.vn.repository;
 
-import static com.usth.edu.vn.exception.ExceptionType.USER_NOT_FOUND;
-import static com.usth.edu.vn.services.FileName.MODELS;
-
-import java.io.File;
-import java.io.IOException;
-import java.sql.Timestamp;
-import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.Date;
 import java.util.List;
-import java.util.Optional;
 
-import org.jboss.resteasy.reactive.multipart.FileUpload;
-
-import com.usth.edu.vn.exception.CustomException;
 import com.usth.edu.vn.model.Models;
-import com.usth.edu.vn.model.Users;
 import com.usth.edu.vn.model.dto.ModelDto;
-import com.usth.edu.vn.services.FileServices;
 
 import io.quarkus.hibernate.orm.panache.PanacheRepository;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.persistence.EntityManager;
-import jakarta.persistence.Query;
+import jakarta.ws.rs.NotFoundException;
 
 @ApplicationScoped
 public class ModelRepository implements PanacheRepository<Models> {
 
   @Inject
-  UserRepository userRepository;
-
-  @Inject
-  FileServices fileServices;
-
-  @Inject
   EntityManager entityManager;
 
-  private static final int PAGE_SIZE = 10;
+  private static final int TOP_N = 10;
 
-  public Models getModelById(long id) {
-    Models model = findById(id);
-    return Models
-        .builder()
-        .name(model.getName())
-        .type(model.getType())
-        .user(userRepository.getUserById(model.getUser().getId()))
-        .filepath(model.getFilepath())
-        .description(model.getDescription())
-        .createTime(model.getCreateTime())
-        .build();
+  /**
+   * Average stars and usage count are computed with correlated subqueries, so
+   * there is no outer aggregation (no GROUP BY needed, no ONLY_FULL_GROUP_BY
+   * error) and no Ratings x Inferences row blow-up.
+   * Argument order must match the {@link ModelDto} constructor.
+   */
+  private static final String SELECT_MODEL_DTO = """
+      SELECT new com.usth.edu.vn.model.dto.ModelDto(
+          m.id,
+          m.name,
+          m.type,
+          m.filepath,
+          m.description,
+          (SELECT AVG(r.stars) FROM Ratings r WHERE r.model = m),
+          (SELECT COUNT(i.id) FROM Inferences i WHERE i.model = m),
+          u.id,
+          u.username,
+          ud.firstname,
+          ud.lastname,
+          m.createTime
+      )
+      FROM Models m
+      LEFT JOIN m.user u
+      LEFT JOIN u.userDetail ud
+      """;
+
+  private static final String AVG_STARS = "(SELECT AVG(r2.stars) FROM Ratings r2 WHERE r2.model = m)";
+
+  private static final String USAGE_COUNT = "(SELECT COUNT(i2.id) FROM Inferences i2 WHERE i2.model = m)";
+
+  private List<ModelDto> list(String suffix) {
+    return entityManager.createQuery(SELECT_MODEL_DTO + suffix, ModelDto.class).getResultList();
   }
 
+  /** @throws NotFoundException (404) when no model has this id */
   public ModelDto findModelById(long id) {
-    return entityManager
-        .createQuery("""
-            SELECT new com.usth.edu.vn.model.dto.ModelDto(
-                  m.id,
-                  m.name,
-                  m.type,
-                  m.filepath,
-                  m.description,
-                  AVG(r.stars),
-                  COUNT(DISTINCT i.id),
-                  m.user.id,
-                  u.username,
-                  ud.firstname,
-                  ud.lastname,
-                  m.createTime
-            )
-            FROM Models m
-            LEFT JOIN Users u
-            ON u.id = m.user.id
-            LEFT JOIN UserDetails ud
-            ON ud.id = u.userDetail.id
-            LEFT JOIN Ratings r
-            ON m.id = r.model.id
-            LEFT JOIN Inferences i
-            ON m.id = i.model.id
-            WHERE m.id = :id
-            """, ModelDto.class)
+    return entityManager.createQuery(SELECT_MODEL_DTO + "WHERE m.id = :id", ModelDto.class)
         .setParameter("id", id)
-        .getSingleResult();
+        .getResultStream()
+        .findFirst()
+        .orElseThrow(() -> new NotFoundException("Model " + id + " not found"));
   }
 
-  public List<ModelDto> findModelsByUser(long user_id) {
-    return entityManager
-        .createQuery("""
-            SELECT new com.usth.edu.vn.model.dto.ModelDto(
-                  m.id,
-                  m.name,
-                  m.type,
-                  m.filepath,
-                  m.description,
-                  AVG(r.stars),
-                  COUNT(DISTINCT i.id),
-                  m.user.id,
-                  u.username,
-                  ud.firstname,
-                  ud.lastname,
-                  m.createTime
-            )
-            FROM Models m
-            LEFT JOIN Users u
-            ON u.id = m.user.id
-            LEFT JOIN UserDetails ud
-            ON ud.id = u.userDetail.id
-            LEFT JOIN Ratings r
-            ON m.id = r.model.id
-            LEFT JOIN Inferences i
-            ON m.id = i.model.id
-            WHERE u.id = :user_id
-            GROUP BY m.id
-            """, ModelDto.class)
-        .setParameter("user_id", user_id)
+  public List<ModelDto> findModelsByUser(long userId) {
+    return entityManager.createQuery(SELECT_MODEL_DTO + "WHERE u.id = :userId ORDER BY m.id", ModelDto.class)
+        .setParameter("userId", userId)
         .getResultList();
   }
 
   public List<ModelDto> findAllModels() {
-    return entityManager
-        .createQuery("""
-            SELECT new com.usth.edu.vn.model.dto.ModelDto(
-                m.id,
-                m.name,
-                m.type,
-                m.filepath,
-                m.description,
-                AVG(r.stars),
-                COUNT(DISTINCT i.id),
-                m.user.id,
-                u.username,
-                ud.firstname,
-                ud.lastname,
-                m.createTime
-            )
-            FROM Models m
-            LEFT JOIN Users u
-            ON u.id = m.user.id
-            LEFT JOIN UserDetails ud
-            ON ud.id = u.userDetail.id
-            LEFT JOIN Ratings r
-            ON m.id = r.model.id
-            LEFT JOIN Inferences i
-            ON m.id = i.model.id
-            GROUP BY m.id
-            """, ModelDto.class)
-        .getResultList();
+    return list("ORDER BY m.id");
   }
 
   public List<ModelDto> findTopTenRecentlyCreatedModels() {
-    return entityManager
-        .createQuery("""
-            SELECT new com.usth.edu.vn.model.dto.ModelDto(
-                  m.id,
-                  m.name,
-                  m.type,
-                  m.filepath,
-                  m.description,
-                  AVG(r.stars),
-                  COUNT(DISTINCT i.id),
-                  m.user.id,
-                  u.username,
-                  ud.firstname,
-                  ud.lastname,
-                  m.createTime
-            )
-            FROM Models m
-            LEFT JOIN Users u
-            ON u.id = m.user.id
-            LEFT JOIN UserDetails ud
-            ON ud.id = u.userDetail.id
-            LEFT JOIN Ratings r
-            ON m.id = r.model.id
-            LEFT JOIN Inferences i
-            ON m.id = i.model.id
-            GROUP BY m.id
-            ORDER BY m.createTime DESC
-            LIMIT 10
-            """, ModelDto.class)
+    return entityManager.createQuery(SELECT_MODEL_DTO + "ORDER BY m.createTime DESC, m.id DESC", ModelDto.class)
+        .setMaxResults(TOP_N)
         .getResultList();
   }
 
   public List<ModelDto> findTopTenMostUsedModels() {
-    Query query = entityManager
-        .createNativeQuery("""
-            SELECT
-                  m.id,
-                  m.name,
-                  m.type,
-                  m.filepath,
-                  m.description,
-                  AVG(r.stars),
-                  new_i.inference_count,
-                  m.user_id,
-                  u.username,
-                  ud.firstname,
-                  ud.lastname,
-                  m.createTime
-            FROM models m
-            LEFT JOIN users u
-            ON u.id = m.user_id
-            LEFT JOIN user_details ud
-            ON ud.user_id = u.id
-            LEFT JOIN (
-                SELECT
-                    i.model_id,
-                    COUNT(DISTINCT(i.id)) as inference_count
-                FROM inferences i
-                GROUP BY model_id
-                ORDER BY COUNT(*) DESC)
-                AS new_i
-            ON new_i.model_id = m.id
-            LEFT JOIN ratings r
-            ON m.id = r.model_id
-            GROUP BY m.id
-            LIMIT 10
-            """);
-    List<Object[]> result = (List<Object[]>) query.getResultList();
-    List<ModelDto> allModels = new ArrayList<>(result.size());
-    for (Object[] o : result) {
-      ModelDto modelDto = new ModelDto();
-      modelDto.setId(Long.parseLong(o[0].toString()));
-      modelDto.setName(o[1].toString());
-      modelDto.setType(o[2].toString());
-      modelDto.setFilepath(o[3].toString());
-      modelDto.setDescription(o[4].toString());
-      modelDto.setStars(o[5] == null ? null : Double.parseDouble(o[5].toString()));
-      modelDto.setUsageCount(o[6] == null ? 0 : Long.parseLong(o[6].toString()));
-      modelDto.setUser_id(Long.parseLong(o[7].toString()));
-      modelDto.setUsername(o[8].toString());
-      modelDto.setFirstname(o[9].toString());
-      modelDto.setLastname(o[10].toString());
-      // Hibernate ORM 7 returns java.time types for native query datetime columns
-      modelDto.setCreateTime(o[11] instanceof LocalDateTime createTime ? Timestamp.valueOf(createTime) : (Date) o[11]);
-      allModels.add(modelDto);
-    }
-    return allModels;
-  }
-
-  public List<ModelDto> findTop10BestRatingModels() {
-    return entityManager
-        .createQuery("""
-            SELECT new com.usth.edu.vn.model.dto.ModelDto(
-                  m.id,
-                  m.name,
-                  m.type,
-                  m.filepath,
-                  m.description,
-                  AVG(r.stars),
-                  COUNT(DISTINCT i.id),
-                  m.user.id,
-                  u.username,
-                  ud.firstname,
-                  ud.lastname,
-                  m.createTime
-            )
-            FROM Models m
-            LEFT JOIN Users u
-            ON u.id = m.user.id
-            LEFT JOIN UserDetails ud
-            ON ud.id = u.userDetail.id
-            LEFT JOIN Ratings r
-            ON m.id = r.model.id
-            LEFT JOIN Inferences i
-            ON m.id = i.model.id
-            GROUP BY m.id
-            ORDER BY AVG(r.stars) DESC
-            LIMIT 10
-            """, ModelDto.class)
+    return entityManager.createQuery(SELECT_MODEL_DTO + "ORDER BY " + USAGE_COUNT + " DESC, m.id", ModelDto.class)
+        .setMaxResults(TOP_N)
         .getResultList();
   }
 
-  public List<ModelDto> findPagingModels(int pageNo, int pageSize) {
+  /** Unrated models sort last. */
+  public List<ModelDto> findTop10BestRatingModels() {
     return entityManager
-        .createQuery("""
-            SELECT new com.usth.edu.vn.model.dto.ModelDto(
-                  m.id,
-                  m.name,
-                  m.type,
-                  m.filepath,
-                  m.description,
-                  AVG(r.stars),
-                  COUNT(DISTINCT i.id),
-                  m.user.id,
-                  u.username,
-                  ud.firstname,
-                  ud.lastname,
-                  m.createTime
-            )
-            FROM Models m
-            LEFT JOIN Users u
-            ON u.id = m.user.id
-            LEFT JOIN UserDetails ud
-            ON ud.id = u.userDetail.id
-            LEFT JOIN Ratings r
-            ON m.id = r.model.id
-            LEFT JOIN Inferences i
-            ON m.id = i.model.id
-            GROUP BY m.id
-            """, ModelDto.class)
+        .createQuery(SELECT_MODEL_DTO + "ORDER BY COALESCE(" + AVG_STARS + ", 0.0) DESC, m.id", ModelDto.class)
+        .setMaxResults(TOP_N)
+        .getResultList();
+  }
+
+  /** @param pageNo 1-based page number (validated >= 1 by the resource) */
+  public List<ModelDto> findPagingModels(int pageNo, int pageSize) {
+    return entityManager.createQuery(SELECT_MODEL_DTO + "ORDER BY m.id", ModelDto.class)
         .setFirstResult((pageNo - 1) * pageSize)
         .setMaxResults(pageSize)
         .getResultList();
   }
 
   public List<ModelDto> findMatchedModels(String keyword) {
-    return entityManager
-        .createQuery("""
-            SELECT new com.usth.edu.vn.model.dto.ModelDto(
-                m.id,
-                m.name,
-                m.type,
-                m.filepath,
-                m.description,
-                AVG(r.stars),
-                COUNT(DISTINCT i.id),
-                m.user.id,
-                u.username,
-                ud.firstname,
-                ud.lastname,
-                m.createTime
-            )
-            FROM Models m
-            LEFT JOIN Users u
-            ON u.id = m.user.id
-            LEFT JOIN UserDetails ud
-            ON ud.id = u.userDetail.id
-            LEFT JOIN Ratings r
-            ON m.id = r.model.id
-            LEFT JOIN Inferences i
-            ON m.id = i.model.id
-            WHERE m.name LIKE :name
-            OR m.type LIKE :type
-            OR m.description LIKE :description
-            GROUP BY m.id
-            """, ModelDto.class)
-        .setParameter("name", "%" + keyword + "%")
-        .setParameter("type", "%" + keyword + "%")
-        .setParameter("description", "%" + keyword + "%")
+    return entityManager.createQuery(SELECT_MODEL_DTO + """
+        WHERE m.name LIKE :kw
+        OR m.type LIKE :kw
+        OR m.description LIKE :kw
+        ORDER BY m.id
+        """, ModelDto.class)
+        .setParameter("kw", "%" + keyword + "%")
         .getResultList();
   }
 
-  public void addModel(long user_id, Models model, FileUpload modelFile) throws IOException, CustomException {
-    Optional<Users> existedUser = userRepository.findByIdOptional(user_id);
-    if (existedUser.isEmpty()) {
-      throw new CustomException(USER_NOT_FOUND);
-    }
-    model.setFilepath(fileServices.uploadFile(user_id, modelFile, MODELS + File.separator + model.getType()));
-    model.setUser(existedUser.get());
-    model.setCreateTime(new Date());
-    persist(model);
-  }
-
-  public void updateModel(long id, Models model) throws CustomException {
-    Optional<Models> existedModel = findByIdOptional(id);
-    if (existedModel.isEmpty()) {
-      throw new CustomException("Model does not existed!");
-    } else {
-      Models saveModel = existedModel.get();
-      if (model.getName() != null) {
-        saveModel.setName(model.getName());
-      }
-      if (model.getType() != null) {
-        saveModel.setType(model.getType());
-      }
-      if (model.getDescription() != null) {
-        saveModel.setDescription(model.getDescription());
-      }
-    }
-  }
-
-  public void deleteModel(long id) {
-    deleteById(id);
+  /**
+   * Deletes the model together with its ratings and inferences.
+   * The children are bulk-deleted first so the model row can be removed without
+   * FK violations and without loading every child entity.
+   */
+  public void deleteModelCascade(Models model) {
+    entityManager.createQuery("DELETE FROM Ratings r WHERE r.model = :model")
+        .setParameter("model", model)
+        .executeUpdate();
+    entityManager.createQuery("DELETE FROM Inferences i WHERE i.model = :model")
+        .setParameter("model", model)
+        .executeUpdate();
+    delete(model);
   }
 }

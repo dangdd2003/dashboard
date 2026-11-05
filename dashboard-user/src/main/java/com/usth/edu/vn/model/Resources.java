@@ -8,11 +8,14 @@ import com.fasterxml.jackson.annotation.ObjectIdGenerators;
 
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.EqualsAndHashCode;
+import lombok.Getter;
 import lombok.NoArgsConstructor;
+import lombok.Setter;
 
-@Data
+// No @Data: Lombok equals/hashCode/toString over the bidirectional relationships
+// recurse (StackOverflowError) and trigger lazy loading. Identity equality is used.
+@Getter
+@Setter
 @Entity
 @AllArgsConstructor
 @NoArgsConstructor
@@ -24,6 +27,7 @@ public class Resources {
   @GeneratedValue(strategy = GenerationType.IDENTITY)
   private long id;
 
+  /** Path relative to the configured storage root (never absolute, never client-supplied). */
   private String filepath;
 
   private String type;
@@ -32,10 +36,8 @@ public class Resources {
 
   @ManyToOne
   @JoinColumn(name = "user_id", referencedColumnName = "id")
-  @EqualsAndHashCode.Exclude
   private Users user;
 
   @OneToMany(mappedBy = "resource", cascade = CascadeType.PERSIST, orphanRemoval = true)
-  @EqualsAndHashCode.Exclude
   private Set<Inferences> inference;
 }

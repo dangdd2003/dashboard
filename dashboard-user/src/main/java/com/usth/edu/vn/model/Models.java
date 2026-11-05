@@ -10,11 +10,20 @@ import jakarta.persistence.*;
 
 import lombok.AllArgsConstructor;
 import lombok.Builder;
-import lombok.Data;
-import lombok.EqualsAndHashCode;
+import lombok.Getter;
 import lombok.NoArgsConstructor;
+import lombok.Setter;
 
-@Data
+/**
+ * A trained model uploaded by a user.
+ * <p>
+ * Deleting a model also deletes its ratings and inferences (cascade REMOVE + orphanRemoval),
+ * so neither a model delete nor a user delete fails on the inference/rating foreign keys.
+ * <p>
+ * No Lombok equals/hashCode/toString: they would traverse the bidirectional relationships.
+ */
+@Getter
+@Setter
 @Builder
 @Entity
 @AllArgsConstructor
@@ -31,6 +40,7 @@ public class Models {
 
   private String type;
 
+  /** Path of the stored file, relative to the storage root. */
   private String filepath;
 
   @Column(columnDefinition = "TEXT")
@@ -40,14 +50,11 @@ public class Models {
 
   @ManyToOne
   @JoinColumn(name = "user_id", referencedColumnName = "id")
-  @EqualsAndHashCode.Exclude
   private Users user;
 
-  @OneToMany(mappedBy = "model", cascade = CascadeType.PERSIST)
-  @EqualsAndHashCode.Exclude
+  @OneToMany(mappedBy = "model", cascade = CascadeType.ALL, orphanRemoval = true)
   private Set<Inferences> inference;
 
   @OneToMany(mappedBy = "model", cascade = CascadeType.ALL, orphanRemoval = true)
-  @EqualsAndHashCode.Exclude
   private Set<Ratings> ratings;
 }

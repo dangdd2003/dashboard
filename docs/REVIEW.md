@@ -7,7 +7,11 @@ re-verified against the source.
 
 Paths are relative to `dashboard-user/src/main/java/com/usth/edu/vn/` unless stated otherwise.
 
-Status legend: **[done]** fixed on this branch · **[todo]** recommended fix, not yet applied.
+**Status (v2.0):** all Critical/High/Medium items in sections 1–4 have been applied on this branch,
+plus most Low items. Still open: automated tests (B8 — none exist yet; Dev Services MySQL needs Docker),
+Flyway migrations (S11), refresh tokens / revocation (S10), rate limiting (S9), and a data migration for
+pre-2.0 rows that store absolute file paths (they are refused with 403 on download). Existing databases
+also need `ALTER TABLE user_management.inferences MODIFY result TEXT;`.
 
 ---
 

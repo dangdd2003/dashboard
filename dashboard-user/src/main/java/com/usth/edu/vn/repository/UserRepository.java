@@ -1,231 +1,221 @@
 package com.usth.edu.vn.repository;
 
-import com.usth.edu.vn.exception.CustomException;
 import com.usth.edu.vn.model.UserDetails;
 import com.usth.edu.vn.model.Users;
 import com.usth.edu.vn.model.dto.UserDto;
+import com.usth.edu.vn.model.dto.request.UserCreateRequest;
+import com.usth.edu.vn.model.dto.request.UserDetailRequest;
+import com.usth.edu.vn.model.dto.request.UserDetailUpdateRequest;
+import com.usth.edu.vn.model.dto.request.UserUpdateRequest;
 
 import io.quarkus.elytron.security.common.BcryptUtil;
 import io.quarkus.hibernate.orm.panache.PanacheRepository;
 import jakarta.enterprise.context.ApplicationScoped;
-import jakarta.inject.Inject;
-import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceException;
+import jakarta.ws.rs.BadRequestException;
+import jakarta.ws.rs.ClientErrorException;
 
+import java.sql.SQLIntegrityConstraintViolationException;
 import java.util.Date;
 import java.util.List;
 import java.util.Optional;
-
-import static com.usth.edu.vn.exception.ExceptionType.INCORRECT_PASSWORD;
-import static com.usth.edu.vn.exception.ExceptionType.USER_EXISTED;
-import static com.usth.edu.vn.exception.ExceptionType.USER_NOT_FOUND;
+import java.util.Set;
 
 @ApplicationScoped
 public class UserRepository implements PanacheRepository<Users> {
 
-  @Inject
-  UserDetailsRepository userDetailsRepository;
+  public static final String ROLE_ADMIN = "admin";
+  public static final String ROLE_USER = "user";
+  public static final Set<String> ROLES = Set.of(ROLE_ADMIN, ROLE_USER);
 
-  @Inject
-  EntityManager entityManager;
+  static final String USER_EXISTED_MESSAGE = "User is already existed!";
 
-  private static final int PAGE_SIZE = 20;
-
-  public Users getUserById(long id) {
-    Users user = findById(id);
-    return Users
-        .builder()
-        .username(user.getUsername())
-        .userDetail(userDetailsRepository.getUserDetail(id))
-        .build();
-  }
+  /** Never selects the password hash. LEFT JOIN so users without a detail row are still listed. */
+  private static final String SELECT_USER_DTO = """
+      SELECT NEW com.usth.edu.vn.model.dto.UserDto(
+          u.id,
+          u.username,
+          u.roles,
+          ud.firstname,
+          ud.lastname,
+          ud.email,
+          ud.createTime
+      )
+      FROM Users u
+      LEFT JOIN u.userDetail ud
+      """;
 
   public Optional<UserDto> findUserById(long id) {
-    return entityManager
-        .createQuery("""
-            SELECT NEW com.usth.edu.vn.model.dto.UserDto(
-                u.id,
-                u.username,
-                u.password,
-                u.roles,
-                ud.firstname,
-                ud.lastname,
-                ud.email,
-                ud.createTime
-            )
-            FROM Users u
-            INNER JOIN UserDetails ud
-            ON u.id = ud.user.id
-            WHERE u.id = :id
-            """, UserDto.class)
+    return getEntityManager()
+        .createQuery(SELECT_USER_DTO + " WHERE u.id = :id", UserDto.class)
         .setParameter("id", id)
         .getResultStream()
-        .findAny();
+        .findFirst();
   }
 
   public Optional<UserDto> findUserByUsername(String username) {
-    return entityManager
-        .createQuery("""
-            SELECT NEW com.usth.edu.vn.model.dto.UserDto(
-                u.id,
-                u.username,
-                u.password,
-                u.roles,
-                ud.firstname,
-                ud.lastname,
-                ud.email,
-                ud.createTime
-            )
-            FROM Users u
-            INNER JOIN UserDetails ud
-            ON u.id = ud.user.id
-            WHERE u.username = :username
-            """, UserDto.class)
+    return getEntityManager()
+        .createQuery(SELECT_USER_DTO + " WHERE u.username = :username", UserDto.class)
         .setParameter("username", username)
         .getResultStream()
-        .findAny();
+        .findFirst();
   }
 
   public List<UserDto> findAllUsers() {
-    return entityManager
-        .createQuery("""
-            SELECT NEW com.usth.edu.vn.model.dto.UserDto(
-                u.id,
-                u.username,
-                u.password,
-                u.roles,
-                ud.firstname,
-                ud.lastname,
-                ud.email,
-                ud.createTime
-            )
-            FROM Users u
-            INNER JOIN UserDetails ud
-            ON u.id = ud.user.id
-            """,
-            UserDto.class)
+    return getEntityManager()
+        .createQuery(SELECT_USER_DTO + " ORDER BY u.id", UserDto.class)
         .getResultList();
   }
 
+  /** @param pageNo 1-based page number; @param pageSize page size (>= 1). */
   public List<UserDto> findPagingUsers(int pageNo, int pageSize) {
-    return entityManager
-        .createQuery("""
-            SELECT NEW com.usth.edu.vn.model.dto.UserDto(
-                u.id,
-                u.username,
-                u.password,
-                u.roles,
-                ud.firstname,
-                ud.lastname,
-                ud.email,
-                ud.createTime
-            )
-            FROM Users u
-            INNER JOIN UserDetails ud
-            ON u.id = ud.user.id
-            """,
-            UserDto.class)
-        .setFirstResult((pageNo - 1) * pageSize)
+    long offset = offset(pageNo, pageSize);
+    if (offset > Integer.MAX_VALUE) {
+      return List.of();
+    }
+    return getEntityManager()
+        .createQuery(SELECT_USER_DTO + " ORDER BY u.id", UserDto.class)
+        .setFirstResult((int) offset)
         .setMaxResults(pageSize)
         .getResultList();
   }
 
-  public List<UserDto> findMatchedUsers(String keyword) {
-    return entityManager
-        .createQuery("""
-              SELECT new com.usth.edu.vn.model.dto.UserDto(
-                  u.id,
-                  u.username,
-                  u.password,
-                  u.roles,
-                  ud.firstname,
-                  ud.lastname,
-                  ud.email,
-                  ud.createTime
-              )
-              FROM Users u
-              INNER JOIN UserDetails ud
-              ON u.id = ud.user.id
-            WHERE u.username LIKE :username
-            OR ud.firstname LIKE :firstname
-            OR ud.lastname LIKE :lastname
-            OR ud.email LIKE :email
+  /** Substring search over username, first/last name and email (LIKE wildcards in the keyword are literal). */
+  public List<UserDto> findMatchedUsers(String keyword, int pageNo, int pageSize) {
+    long offset = offset(pageNo, pageSize);
+    if (offset > Integer.MAX_VALUE) {
+      return List.of();
+    }
+    String pattern = "%" + escapeLike(keyword == null ? "" : keyword) + "%";
+    return getEntityManager()
+        .createQuery(SELECT_USER_DTO + """
+             WHERE u.username LIKE :kw ESCAPE '!'
+            OR ud.firstname LIKE :kw ESCAPE '!'
+            OR ud.lastname LIKE :kw ESCAPE '!'
+            OR ud.email LIKE :kw ESCAPE '!'
+            ORDER BY u.id
             """, UserDto.class)
-        .setParameter("username", "%" + keyword + "%")
-        .setParameter("firstname", "%" + keyword + "%")
-        .setParameter("lastname", "%" + keyword + "%")
-        .setParameter("email", "%" + keyword + "%")
+        .setParameter("kw", pattern)
+        .setFirstResult((int) offset)
+        .setMaxResults(pageSize)
         .getResultList();
   }
 
   public Optional<Users> findByUsername(String username) {
-    return streamAll().filter(user -> user
-        .getUsername()
-        .equals(username))
-        .findFirst();
+    return find("username", username).firstResultOptional();
   }
 
-  public void addUser(Users user) throws CustomException {
-    if (findByUsername(user.getUsername()).isPresent()) {
-      throw new CustomException(USER_EXISTED);
-    } else {
-      UserDetails userDetail = user.getUserDetail();
-      userDetail.setCreateTime(new Date());
-      userDetail.setUser(user);
-      user.setRoles("user");
+  public boolean existsByUsername(String username) {
+    return count("username", username) > 0;
+  }
+
+  /**
+   * Registers a new user with role {@code user}. The request must already be validated
+   * ({@code @Valid}); the raw password is hashed here.
+   *
+   * @throws ClientErrorException 409 if the username is taken
+   */
+  public Users createUser(UserCreateRequest request) {
+    if (existsByUsername(request.username())) {
+      throw new ClientErrorException(USER_EXISTED_MESSAGE, 409);
+    }
+    UserDetailRequest detailRequest = request.userDetail();
+
+    Users user = new Users();
+    user.setUsername(request.username());
+    user.setPassword(BcryptUtil.bcryptHash(request.password()));
+    user.setRoles(ROLE_USER);
+
+    UserDetails detail = new UserDetails();
+    detail.setFirstname(detailRequest.firstname());
+    detail.setLastname(detailRequest.lastname());
+    detail.setEmail(detailRequest.email());
+    detail.setCreateTime(new Date());
+    detail.setUser(user);
+    user.setUserDetail(detail);
+
+    try {
       persist(user);
+      flush();
+    } catch (PersistenceException e) {
+      if (isConstraintViolation(e)) {
+        // concurrent registration with the same username hit the unique constraint
+        throw new ClientErrorException(USER_EXISTED_MESSAGE, 409);
+      }
+      throw e;
     }
+    return user;
   }
 
-  public void updateUser(long id, Users user) throws CustomException {
-    Optional<Users> existedUser = findByIdOptional(id);
-    if (existedUser.isEmpty()) {
-      throw new CustomException(USER_NOT_FOUND);
-    } else {
-      Users saveUser = existedUser.get();
-      if (user.getRoles() != null) {
-        saveUser.setRoles(user.getRoles());
-      }
-      if (user.getUserDetail() != null) {
-        String firstname = user.getUserDetail().getFirstname();
-        if (firstname != null) {
-          saveUser.getUserDetail().setFirstname(firstname);
-        }
-        String lastname = user.getUserDetail().getLastname();
-        if (lastname != null) {
-          saveUser.getUserDetail().setLastname(lastname);
-        }
-        String email = user.getUserDetail().getEmail();
-        if (email != null) {
-          saveUser.getUserDetail().setEmail(email);
-        }
+  private static boolean isConstraintViolation(Throwable e) {
+    for (Throwable t = e; t != null; t = t.getCause() == t ? null : t.getCause()) {
+      if (t instanceof org.hibernate.exception.ConstraintViolationException
+          || t instanceof SQLIntegrityConstraintViolationException) {
+        return true;
       }
     }
+    return false;
   }
 
-  public void updatePassword(long id, String oldPassword, String newPassword) throws CustomException {
-    Optional<Users> user = findByIdOptional(id);
-    if (user.isPresent()) {
-      if (BcryptUtil.matches(oldPassword, user.get().getPassword())) {
-        user.get().setPassword(newPassword);
-      } else
-        throw new CustomException(INCORRECT_PASSWORD);
-    } else
-      throw new CustomException(USER_NOT_FOUND);
-  }
-
-  public void deleteUser(long id) throws CustomException {
-    if (findByIdOptional(id).isEmpty()) {
-      throw new CustomException(USER_NOT_FOUND);
-    } else {
-      delete(findById(id));
+  /** Applies the non-null profile fields of {@code request} to the (managed) {@code user}. */
+  public Users updateDetails(Users user, UserUpdateRequest request) {
+    UserDetailUpdateRequest changes = request.userDetail();
+    if (changes == null) {
+      return user;
     }
+    UserDetails detail = user.getUserDetail();
+    if (detail == null) {
+      if (changes.firstname() == null || changes.lastname() == null) {
+        throw new BadRequestException("First name and last name are required!");
+      }
+      detail = new UserDetails();
+      detail.setCreateTime(new Date());
+      detail.setUser(user);
+      user.setUserDetail(detail);
+      getEntityManager().persist(detail);
+    }
+    if (changes.firstname() != null) {
+      detail.setFirstname(changes.firstname());
+    }
+    if (changes.lastname() != null) {
+      detail.setLastname(changes.lastname());
+    }
+    if (changes.email() != null) {
+      detail.setEmail(changes.email());
+    }
+    return user;
   }
 
-  public void deleteUser(String username) throws CustomException {
-    if (findByUsername(username).isEmpty()) {
-      throw new CustomException(USER_NOT_FOUND);
-    } else {
-      delete(findByUsername(username).get());
+  /** Sets the role of the (managed) {@code user}; {@code role} must be one of {@link #ROLES}. */
+  public Users updateRole(Users user, String role) {
+    if (role == null || !ROLES.contains(role)) {
+      throw new BadRequestException("Role must be 'admin' or 'user'!");
     }
+    user.setRoles(role);
+    return user;
+  }
+
+  /**
+   * Changes the password of the (managed) {@code user}. The new password must already be validated.
+   *
+   * @param verifyOldPassword when true, {@code oldPassword} must match the stored hash (else 400)
+   */
+  public void updatePassword(Users user, String oldPassword, String newPassword, boolean verifyOldPassword) {
+    if (verifyOldPassword
+        && (oldPassword == null || !BcryptUtil.matches(oldPassword, user.getPassword()))) {
+      throw new BadRequestException("Password is not matched!");
+    }
+    user.setPassword(BcryptUtil.bcryptHash(newPassword));
+  }
+
+  private static long offset(int pageNo, int pageSize) {
+    return (long) (Math.max(pageNo, 1) - 1) * Math.max(pageSize, 1);
+  }
+
+  private static String escapeLike(String value) {
+    return value
+        .replace("!", "!!")
+        .replace("%", "!%")
+        .replace("_", "!_");
   }
 }
