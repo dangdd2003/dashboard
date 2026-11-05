@@ -37,7 +37,7 @@ cat <<'EOF'
 Dashboard is up:
   dashboard-security (token endpoint)  http://localhost:8080/jwt
   dashboard-user     (API)             http://localhost:8081
-  health                               http://localhost:8081/q/health
+  health                               http://localhost:8081/q/health/ready
 
 Logs: docker compose logs -f    Stop: docker compose down
 EOF
